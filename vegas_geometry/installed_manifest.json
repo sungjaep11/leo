@@ -1,0 +1,13 @@
+{
+  "src/internet/model/tcp-vegas.h": "572935f81b4cb80f87fd14464194a304b0891ff5d385f015512a81d17832f994",
+  "src/internet/model/tcp-vegas.cc": "e0e1710175f8e0925a32c9dbbcd91b5b47612e8e7c91a2a55d97b4c56f019fc9",
+  "src/internet/model/tcp-socket-base.h": "0510f7ee8b43e134d7ecbfd721c33dc73bf46bc38e65f3e5c812213d2fc21ca5",
+  "contrib/basic-sim/model/apps/tcp-flow-send-application.cc": "a47210d75af39a0b1d5531afb59004c6201dd368a1f61be147837e6cdede46f6",
+  "scratch/main_satnet/main_satnet.cc": "b52281cb5a6fdf30009b3e8019b0ae456d43f02d85e5baea2b063e603fc01f11",
+  "contrib/basic-sim/model/apps/lab1-vegas-socket-trace.h": "83ecf2a3af9f3cfff7089d33fde84edcdfa1d67caeca3d0129b514f4e5b64f72",
+  "scratch/main_satnet/lab1-vegas-queue-trace.h": "217d0180435a35060c1b982286e971628d5b4d9ca937e3622c5ef61b0137c77c",
+  "scratch/main_satnet/lab1-oracle-probe.h": "355b8b5eb42467f0a46ceca3577818b73070febd57e26ceb362d14ee2c64ca37",
+  "src/internet/model/lab1-vegas-rolling-min.h": "58e432f6bccfcb778a73c3c974ac7f083d0dfb659973eb85f2296b60de7c4081",
+  "src/internet/model/tcp-socket-base.cc": "f27c9672ec693b16210f847ecd88e8f77c901e459f9c4d7418408fdeffe324d5",
+  "scratch/main_satnet/lab1-geometry-service.h": "937558277991a2a379de99987917d3ed3f62dae2d9a1f3cb4682d701d6154347"
+}

@@ -1,0 +1,3 @@
+# Already installed in the pinned Docker image; only needed for external analysis.
+numpy==2.4.4
+matplotlib==3.10.8

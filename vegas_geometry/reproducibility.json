@@ -1,0 +1,48 @@
+{
+  "verified_date": "2026-10-09",
+  "full_suite_status": "passed",
+  "completed_experiments": 14,
+  "comparison_windows_matched": 77,
+  "relocated_powershell_smoke_status": "passed",
+  "only_bundle_directory_mounted": true,
+  "existing_lab_container_or_volume_used": false,
+  "environment": {
+    "image": "ghcr.io/yeonjong21/cs30401-lab1@sha256:3cb4877c73b4ae5e3542c1567b6761a8913056dd429d8a18f7c40aeeb399b3b4",
+    "ns3_commit": "99bc6f733274475b7a6e804128651e17ee2a2536",
+    "state_archive_sha256": "7d68a9ed839dfc999449aa6824d532cd4ab30243db0af28bad30d7c9bee6c7ae",
+    "state_files": 4007,
+    "numpy": "2.4.4",
+    "matplotlib": "3.10.8"
+  },
+  "validation": {
+    "disabled_control_byte_equal": {
+      "tcp_flow_0_cwnd.csv": true,
+      "tcp_flow_0_progress.csv": true,
+      "tcp_flow_0_rtt.csv": true
+    },
+    "predictions_identical_with_competing_traffic": true,
+    "predictions_identical_with_changed_ACK_behavior": true,
+    "two_connections_share_one_cache": true,
+    "sharing_cost": {
+      "enabled": true,
+      "interval_ms": 100,
+      "delivery_ms": 0,
+      "registered_connections": 2,
+      "cached_paths": 1,
+      "prediction_builds": 50,
+      "link_visits": 1152,
+      "cache_lookups": 1704,
+      "cache_misses": 0,
+      "max_history_entries_per_path": 50,
+      "build_wall_ns": 2417349,
+      "lookup_wall_ns": 105128,
+      "max_build_wall_ns": 91695,
+      "max_lookup_wall_ns": 460,
+      "traffic_control_drop_events": 0
+    },
+    "note": "No position/routing/queue trace from the unloaded calibration is consumed by the algorithm. Old calibration is an analysis-only reference.",
+    "installed_source_integrity": true,
+    "reference_metric_windows_matched": 77
+  },
+  "note": "Wall-clock timing is host-dependent and excluded from deterministic result equality checks. The referenced Docker image remains a required runtime dependency."
+}

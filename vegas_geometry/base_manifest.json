@@ -1,0 +1,13 @@
+{
+  "src/internet/model/tcp-vegas.h": "b6eecd163ed8fef357ad6ddafa971a31a7da90b5f6ba6ef6768230902f216407",
+  "src/internet/model/tcp-vegas.cc": "4f210e12b5690f8884e783691aac6895ab683a1bbd5feaa424a5c5046bf2550d",
+  "src/internet/model/tcp-socket-base.h": "e1039fb5ed785554a43ed12786aa1ce812209c66b1b527be8943c6c8ac153ef2",
+  "contrib/basic-sim/model/apps/tcp-flow-send-application.cc": "ed54bc37ce8231f9c66a4b47bafb49827835585e79aad2972ae1effeb623b921",
+  "scratch/main_satnet/main_satnet.cc": "997f326373f68dc9ab4d0fcd8f084f7707c0868afa726e3165b4c06a5e897de9",
+  "contrib/basic-sim/model/apps/lab1-vegas-socket-trace.h": null,
+  "scratch/main_satnet/lab1-vegas-queue-trace.h": null,
+  "scratch/main_satnet/lab1-oracle-probe.h": null,
+  "src/internet/model/lab1-vegas-rolling-min.h": null,
+  "src/internet/model/tcp-socket-base.cc": "b6ee80a1d33538f36f0f9f2170a6ca2512beed6850133a47fd00db96f3d70afe",
+  "scratch/main_satnet/lab1-geometry-service.h": null
+}

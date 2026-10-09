@@ -1,0 +1,8 @@
+{
+  "image": "ghcr.io/yeonjong21/cs30401-lab1@sha256:3cb4877c73b4ae5e3542c1567b6761a8913056dd429d8a18f7c40aeeb399b3b4",
+  "ns3_commit": "99bc6f733274475b7a6e804128651e17ee2a2536",
+  "state_archive_sha256": "7d68a9ed839dfc999449aa6824d532cd4ab30243db0af28bad30d7c9bee6c7ae",
+  "state_files": 4007,
+  "numpy": "2.4.4",
+  "matplotlib": "3.10.8"
+}

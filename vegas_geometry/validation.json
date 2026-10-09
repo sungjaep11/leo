@@ -1,0 +1,29 @@
+{
+  "disabled_control_byte_equal": {
+    "cwnd": true,
+    "rtt": true,
+    "progress": true
+  },
+  "predictions_identical_with_competing_traffic": true,
+  "predictions_identical_with_changed_ACK_behavior": true,
+  "two_connections_share_one_cache": true,
+  "sharing_cost": {
+    "enabled": true,
+    "interval_ms": 100,
+    "delivery_ms": 0,
+    "registered_connections": 2,
+    "cached_paths": 1,
+    "prediction_builds": 50,
+    "link_visits": 1152,
+    "cache_lookups": 1704,
+    "cache_misses": 0,
+    "max_history_entries_per_path": 50,
+    "build_wall_ns": 2900419,
+    "lookup_wall_ns": 137318,
+    "max_build_wall_ns": 102073,
+    "max_lookup_wall_ns": 639,
+    "traffic_control_drop_events": 0
+  },
+  "note": "No position/routing/queue trace from the unloaded calibration is consumed by the algorithm. Old calibration is an analysis-only reference.",
+  "installed_source_integrity": true
+}

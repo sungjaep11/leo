@@ -1,0 +1,16 @@
+# Generated state, runs and local maintenance history
+/.runtime/
+/output/
+/_legacy/
+/backups/
+/revisions/
+__pycache__/
+*.pyc
+.mplconfig/
+# Obsolete incremental implementation fragments (source/ is authoritative)
+/geometry_on_recent.patch
+/geometry-api.inc
+/geometry-method.inc
+/geometry-service.h
+/export_bundle.py
+/sync_service.py

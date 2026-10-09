@@ -1,0 +1,943 @@
+--- a/src/internet/model/tcp-vegas.h
++++ b/src/internet/model/tcp-vegas.h
+@@ -16,6 +16,34 @@
+ #define TCPVEGAS_H
+ 
+ #include "tcp-congestion-ops.h"
++#include "rtt-estimator.h"
++#include <functional>
++// LAB1_VEGAS_RECENT
++// Exact sliding-window minimum; timestamps and RTTs are integer nanoseconds.
++#include <cstdint>
++#include <deque>
++#include <utility>
++#include <cassert>
++namespace ns3 {
++class Lab1RollingRtt {
++public:
++    void Add(int64_t now, int64_t rtt, int64_t window) {
++        assert(window > 0 && rtt > 0);
++        assert(m_samples.empty() || now >= m_samples.back().first);
++        while (!m_samples.empty() && m_samples.front().first < now - window)
++            m_samples.pop_front();
++        // A newer equal minimum survives longer than an older one.
++        while (!m_samples.empty() && m_samples.back().second >= rtt)
++            m_samples.pop_back();
++        m_samples.emplace_back(now, rtt);
++    }
++    int64_t Minimum() const { assert(!m_samples.empty()); return m_samples.front().second; }
++    int64_t SourceTime() const { assert(!m_samples.empty()); return m_samples.front().first; }
++private:
++    std::deque<std::pair<int64_t, int64_t>> m_samples;
++};
++}
++
+ 
+ namespace ns3
+ {
+@@ -54,6 +82,21 @@
+ class TcpVegas : public TcpNewReno
+ {
+   public:
++    // LAB1_VEGAS_GEOMETRY: network-assisted, shared prediction service.
++    struct GeometryPrediction {
++        Time computed;
++        Time available;
++        Time rtt;
++        uint64_t route = 0;
++    };
++    using GeometryRegister = std::function<void(uint32_t, uint32_t)>;
++    using GeometryLookup = std::function<bool(uint32_t, uint32_t, Time, GeometryPrediction&)>;
++    static bool Lab1GeometryEnabled();
++    static void Lab1SetGeometryService(GeometryRegister reg, GeometryLookup lookup);
++    void Lab1GeometryEndpoints(uint32_t source, uint32_t destination);
++    void Lab1GeometrySample(Time rawRtt, Ptr<RttEstimator> estimator);
++    // LAB1_VEGAS_DIAG: observer attachment, unused by congestion control.
++    void Lab1SetLog(const std::string& path) { m_lab1LogPath = path; }
+     /**
+      * @brief Get the type ID.
+      * @return the object TypeId
+@@ -142,6 +185,13 @@
+     void DisableVegas();
+ 
+   private:
++    // LAB1_VEGAS_ORACLE: opt-in diagnostic.
++    void Lab1ApplyOracle(Ptr<const TcpSocketState> tcb);
++    static int64_t Lab1RecentWindowNs();
++    void Lab1ApplyRecent(Ptr<const TcpSocketState> tcb);
++    std::string m_lab1LogPath;
++    void Lab1Log(Ptr<const TcpSocketState> tcb, const char* kind, uint32_t before,
++                 int64_t diff = -1, int64_t target = -1, int nextState = -1);
+     uint32_t m_alpha;             //!< Alpha threshold, lower bound of packets in network
+     uint32_t m_beta;              //!< Beta threshold, upper bound of packets in network
+     uint32_t m_gamma;             //!< Gamma threshold, limit on increase
+@@ -149,6 +199,13 @@
+     Time m_minRtt;                //!< Minimum of all RTT measurements within last RTT
+     uint32_t m_cntRtt;            //!< Number of RTT measurements during last RTT
+     bool m_doingVegasNow;         //!< If true, do Vegas for this RTT
++    void Lab1ApplyGeometry(Ptr<const TcpSocketState> tcb);
++    uint32_t m_geoSource = 0, m_geoDestination = 0;
++    bool m_geoAttached = false, m_geoReady = false, m_geoCycleReady = false;
++    Ptr<RttEstimator> m_geoEstimator;
++    GeometryPrediction m_geoLast, m_geoCycleLast;
++    Time m_geoSent, m_geoCycleSent, m_geoCycleEstimate;
++    Lab1RollingRtt m_lab1Recent; // Per-connection state; no global RTT history
+     SequenceNumber32 m_begSndNxt; //!< Right edge during last RTT
+ };
+ 
+--- a/src/internet/model/tcp-vegas.cc
++++ b/src/internet/model/tcp-vegas.cc
+@@ -13,6 +13,17 @@
+  */
+ 
+ #include "tcp-vegas.h"
++// LAB1_VEGAS_DIAG
++#include "ns3/simulator.h"
++#include <fstream>
++#include <iomanip>
++#include <map>
++#include <memory>
++// LAB1_VEGAS_ORACLE
++#include <vector>
++#include <sstream>
++#include <cstdlib>
++#include <cmath>
+ 
+ #include "tcp-socket-state.h"
+ 
+@@ -72,6 +83,7 @@
+       m_minRtt(sock.m_minRtt),
+       m_cntRtt(sock.m_cntRtt),
+       m_doingVegasNow(true),
++      m_lab1Recent(sock.m_lab1Recent),
+       m_begSndNxt(0)
+ {
+     NS_LOG_FUNCTION(this);
+@@ -98,14 +110,29 @@
+         return;
+     }
+ 
++    // Match the prediction to the observation selected by Vegas's cycle minimum.
++    if (Lab1GeometryEnabled() && rtt <= m_minRtt) {
++        m_geoCycleReady = m_geoReady;
++        if (m_geoReady) {
++            m_geoCycleEstimate = m_geoEstimator->GetEstimate();
++            m_geoCycleLast = m_geoLast; m_geoCycleSent = m_geoSent;
++        }
++    }
+     m_minRtt = std::min(m_minRtt, rtt);
+     NS_LOG_DEBUG("Updated m_minRtt = " << m_minRtt);
+ 
++    const Time lab1OldBase = m_baseRtt;
+     m_baseRtt = std::min(m_baseRtt, rtt);
++    // LAB1_VEGAS_RECENT: retain the same PktsAcked input (SRTT in this build).
++    if (const int64_t window = Lab1RecentWindowNs(); window > 0) {
++        m_lab1Recent.Add(Simulator::Now().GetNanoSeconds(), rtt.GetNanoSeconds(), window);
++        m_baseRtt = NanoSeconds(m_lab1Recent.Minimum());
++    }
+     NS_LOG_DEBUG("Updated m_baseRtt = " << m_baseRtt);
+ 
+     // Update RTT counter
+     m_cntRtt++;
++    if (m_baseRtt != lab1OldBase) Lab1Log(tcb, "base_update", tcb->m_cWnd.Get());
+     NS_LOG_DEBUG("Updated m_cntRtt = " << m_cntRtt);
+ }
+ 
+@@ -132,6 +159,7 @@
+ TcpVegas::CongestionStateSet(Ptr<TcpSocketState> tcb, const TcpSocketState::TcpCongState_t newState)
+ {
+     NS_LOG_FUNCTION(this << tcb << newState);
++    Lab1Log(tcb, "state_request", tcb->m_cWnd.Get(), -1, -1, int(newState));
+     if (newState == TcpSocketState::CA_OPEN)
+     {
+         EnableVegas(tcb);
+@@ -146,12 +174,14 @@
+ TcpVegas::IncreaseWindow(Ptr<TcpSocketState> tcb, uint32_t segmentsAcked)
+ {
+     NS_LOG_FUNCTION(this << tcb << segmentsAcked);
++    const uint32_t lab1Before = tcb->m_cWnd.Get();
+ 
+     if (!m_doingVegasNow)
+     {
+         // If Vegas is not on, we follow NewReno algorithm
+         NS_LOG_LOGIC("Vegas is not turned on, we follow NewReno algorithm.");
+         TcpNewReno::IncreaseWindow(tcb, segmentsAcked);
++        Lab1Log(tcb, "reno_disabled", lab1Before);
+         return;
+     }
+ 
+@@ -172,6 +202,7 @@
+             NS_LOG_LOGIC(
+                 "We do not have enough RTT samples to do Vegas, so we behave like NewReno.");
+             TcpNewReno::IncreaseWindow(tcb, segmentsAcked);
++            Lab1Log(tcb, "reno_insufficient_samples", lab1Before);
+         }
+         else
+         {
+@@ -182,6 +213,7 @@
+              * based on the calculated difference between the expected rate and actual sending
+              * rate and the predefined thresholds (alpha, beta, and gamma).
+              */
++            const char* lab1Reason = "hold";
+             uint32_t diff;
+             uint32_t targetCwnd;
+             uint32_t segCwnd = tcb->GetCwndInSegments();
+@@ -194,6 +226,9 @@
+              * desidered throughput is currentCwnd * baseRtt
+              * target cwnd is throughput / minRtt
+              */
++            Lab1ApplyRecent(tcb);
++            Lab1ApplyOracle(tcb);
++            Lab1ApplyGeometry(tcb);
+             double tmp = m_baseRtt.GetSeconds() / m_minRtt.GetSeconds();
+             targetCwnd = static_cast<uint32_t>(segCwnd * tmp);
+             NS_LOG_DEBUG("Calculated targetCwnd = " << targetCwnd);
+@@ -215,6 +250,7 @@
+                  */
+                 NS_LOG_LOGIC("We are going too fast. We need to slow down and "
+                              "change to linear increase/decrease mode.");
++                lab1Reason = "slow_start_exit";
+                 segCwnd = std::min(segCwnd, targetCwnd + 1);
+                 tcb->m_cWnd = segCwnd * tcb->m_segmentSize;
+                 tcb->m_ssThresh = GetSsThresh(tcb, 0);
+@@ -224,6 +260,7 @@
+             { // Slow start mode
+                 NS_LOG_LOGIC("We are in slow start and diff < m_gamma, so we "
+                              "follow NewReno slow start");
++                lab1Reason = "slow_start";
+                 TcpNewReno::SlowStart(tcb, segmentsAcked);
+             }
+             else
+@@ -233,6 +270,7 @@
+                 {
+                     // We are going too fast, so we slow down
+                     NS_LOG_LOGIC("We are going too fast, so we slow down by decrementing cwnd");
++                    lab1Reason = "decrease_diff_gt_beta";
+                     segCwnd--;
+                     tcb->m_cWnd = segCwnd * tcb->m_segmentSize;
+                     tcb->m_ssThresh = GetSsThresh(tcb, 0);
+@@ -244,6 +282,7 @@
+                     // We are going too slow (having too little data in the network),
+                     // so we speed up.
+                     NS_LOG_LOGIC("We are going too slow, so we speed up by incrementing cwnd");
++                    lab1Reason = "increase_diff_lt_alpha";
+                     segCwnd++;
+                     tcb->m_cWnd = segCwnd * tcb->m_segmentSize;
+                     NS_LOG_DEBUG("Updated cwnd = " << tcb->m_cWnd
+@@ -257,6 +296,7 @@
+             }
+             tcb->m_ssThresh = std::max(tcb->m_ssThresh, 3 * tcb->m_cWnd / 4);
+             NS_LOG_DEBUG("Updated ssThresh = " << tcb->m_ssThresh);
++            Lab1Log(tcb, lab1Reason, lab1Before, diff, targetCwnd);
+         }
+ 
+         // Reset cntRtt & minRtt every RTT
+@@ -266,6 +306,7 @@
+     else if (tcb->m_cWnd < tcb->m_ssThresh)
+     {
+         TcpNewReno::SlowStart(tcb, segmentsAcked);
++        Lab1Log(tcb, "slow_start_between_cycles", lab1Before);
+     }
+ }
+ 
+@@ -283,4 +324,171 @@
+                     2 * tcb->m_segmentSize);
+ }
+ 
++// LAB1_VEGAS_DIAG: observation only; no protocol state is modified.
++void
++TcpVegas::Lab1Log(Ptr<const TcpSocketState> tcb, const char* kind, uint32_t before,
++                 int64_t diff, int64_t target, int nextState)
++{
++    if (m_lab1LogPath.empty()) return;
++    static std::map<std::string, std::unique_ptr<std::ofstream>> streams;
++    auto& stream = streams[m_lab1LogPath];
++    if (!stream) {
++        stream = std::make_unique<std::ofstream>(m_lab1LogPath);
++        NS_ABORT_MSG_IF(!*stream, "Cannot open Vegas diagnostic log");
++        *stream << "time_s,kind,state,vegas_enabled,base_ms,min_ms,srtt_ms,last_ms,samples,cwnd_before_bytes,cwnd_after_bytes,ssthresh_bytes,diff,target,alpha,beta,gamma,next_state\n";
++        *stream << std::setprecision(15);
++    }
++    *stream << Simulator::Now().GetSeconds() << ',' << kind << ','
++            << int(tcb->m_congState.Get()) << ',' << m_doingVegasNow << ','
++            << (m_baseRtt == Time::Max() ? -1 : m_baseRtt.GetSeconds()*1000) << ','
++            << (m_minRtt == Time::Max() ? -1 : m_minRtt.GetSeconds()*1000) << ','
++            << tcb->m_srtt.Get().GetSeconds()*1000 << ','
++            << tcb->m_lastRtt.Get().GetSeconds()*1000 << ',' << m_cntRtt << ','
++            << before << ',' << tcb->m_cWnd.Get() << ',' << tcb->m_ssThresh.Get() << ','
++            << diff << ',' << target << ',' << m_alpha << ',' << m_beta << ','
++            << m_gamma << ',' << nextState << '\n';
++}
++
++// LAB1_VEGAS_ORACLE: diagnostic intervention in baseRTT only.
++// Independent unloaded-path samples are indexed by their reply arrival time.
++// No simulator events, cwnd resets, RTT-sample changes, or threshold changes.
++void
++TcpVegas::Lab1ApplyOracle(Ptr<const TcpSocketState> tcb)
++{
++    const char* filename=std::getenv("LAB1_VEGAS_ORACLE_CSV");
++    if(!filename || std::string(filename).empty())return;
++    const char* startFlag=std::getenv("LAB1_VEGAS_ORACLE_START_S");
++    const double start=startFlag?std::stod(startFlag):121.6;
++    const double now=Simulator::Now().GetSeconds();
++    if(now<start)return;
++    static std::vector<std::pair<double,double>> samples;
++    static std::ofstream output;
++    if(samples.empty()) {
++        std::ifstream input(filename);
++        NS_ABORT_MSG_IF(!input,"Cannot open independent no-queue RTT oracle");
++        std::string line;std::getline(input,line);
++        while(std::getline(input,line)) {
++            std::istringstream row(line);std::string when,rtt;
++            if(!std::getline(row,when,',') || !std::getline(row,rtt,','))continue;
++            const double t=std::stod(when),ms=std::stod(rtt);
++            NS_ABORT_MSG_IF(!std::isfinite(t)||!std::isfinite(ms)||ms<=0,"Invalid oracle sample");
++            NS_ABORT_MSG_IF(!samples.empty()&&t<=samples.back().first,"Oracle times must increase strictly");
++            samples.emplace_back(t,ms);
++        }
++        NS_ABORT_MSG_IF(samples.empty(),"Empty oracle");
++        NS_ABORT_MSG_IF(m_lab1LogPath.empty(),"Oracle experiment requires Vegas logging");
++        output.open(m_lab1LogPath+".oracle.csv");
++        NS_ABORT_MSG_IF(!output,"Cannot open oracle intervention log");
++        output << "time_s,source_receive_s,oracle_ms,old_base_ms,effective_base_ms,cycle_min_ms,clamped\n" << std::setprecision(15);
++    }
++    auto it=std::upper_bound(samples.begin(),samples.end(),now,
++        [](double t,const auto& sample){return t<sample.first;});
++    NS_ABORT_MSG_IF(it==samples.begin(),"No past oracle sample available");--it;
++    const Time requested=Seconds(it->second/1000.0);
++    const Time effective=std::min(requested,m_minRtt);
++    const Time previous=m_baseRtt;
++    m_baseRtt=effective;
++    output << now << ',' << it->first << ',' << it->second << ','
++           << previous.GetSeconds()*1000 << ',' << effective.GetSeconds()*1000 << ','
++           << m_minRtt.GetSeconds()*1000 << ',' << (effective<requested) << '\n';
++    Lab1Log(tcb,"oracle_base",tcb->m_cWnd.Get());
++}
++
++// LAB1_VEGAS_RECENT: only sender-observed samples; no route/oracle input.
++int64_t
++TcpVegas::Lab1RecentWindowNs()
++{
++    static const int64_t window = []() -> int64_t {
++        const char* flag = std::getenv("LAB1_VEGAS_RECENT_WINDOW_S");
++        if (!flag || !*flag) return 0;
++        char* end = nullptr;
++        const double seconds = std::strtod(flag, &end);
++        NS_ABORT_MSG_IF(end == flag || *end || !std::isfinite(seconds) || seconds < 0 || seconds > 3600,
++                        "Recent RTT window must be a finite number from 0 to 3600 seconds");
++        const char* oracle = std::getenv("LAB1_VEGAS_ORACLE_CSV");
++        NS_ABORT_MSG_IF(seconds > 0 && oracle && *oracle, "Recent RTT and oracle modes are mutually exclusive");
++        NS_ABORT_MSG_IF(seconds > 0 && Seconds(seconds).GetNanoSeconds() <= 0, "Window is below time resolution");
++        return Seconds(seconds).GetNanoSeconds();
++    }();
++    return window;
++}
++
++void
++TcpVegas::Lab1ApplyRecent(Ptr<const TcpSocketState> tcb)
++{
++    const int64_t window = Lab1RecentWindowNs();
++    if (!window) return;
++    const Time rolling = NanoSeconds(m_lab1Recent.Minimum());
++    // Preserve Vegas's base <= cycle-min invariant if a cycle spans an expiry.
++    // Only an observed sample can lower the estimate; there is no external RTT.
++    m_baseRtt = std::min(rolling, m_minRtt);
++    if (m_lab1LogPath.empty()) return;
++    static std::map<std::string, std::unique_ptr<std::ofstream>> streams;
++    auto& out = streams[m_lab1LogPath];
++    if (!out) {
++        out = std::make_unique<std::ofstream>(m_lab1LogPath + ".recent.csv");
++        NS_ABORT_MSG_IF(!*out, "Cannot open recent RTT audit");
++        *out << "time_s,window_s,source_sample_s,rolling_min_ms,cycle_min_ms,effective_base_ms,clamped\n";
++        *out << std::setprecision(15);
++    }
++    *out << Simulator::Now().GetSeconds() << ',' << double(window)/1e9 << ','
++         << double(m_lab1Recent.SourceTime())/1e9 << ',' << rolling.GetSeconds()*1000 << ','
++         << m_minRtt.GetSeconds()*1000 << ',' << m_baseRtt.GetSeconds()*1000 << ','
++         << (m_baseRtt < rolling) << '\n';
++}
++
++// LAB1_VEGAS_GEOMETRY. No queue/observed RTT is used by the geometry service.
++namespace {
++TcpVegas::GeometryRegister geoRegister;
++TcpVegas::GeometryLookup geoLookup;
++}
++bool TcpVegas::Lab1GeometryEnabled() {
++    static const bool enabled=[](){
++        const char* p=std::getenv("LAB1_VEGAS_GEOMETRY");
++        if (!p || std::string(p)!="1") return false;
++        const char* oracle=std::getenv("LAB1_VEGAS_ORACLE_CSV");
++        NS_ABORT_MSG_IF(oracle && *oracle,"Geometry cannot be combined with the oracle");
++        NS_ABORT_MSG_IF(Lab1RecentWindowNs()>0,"Geometry cannot be combined with a recent minimum");
++        return true;
++    }();
++    return enabled;
++}
++void TcpVegas::Lab1SetGeometryService(GeometryRegister reg, GeometryLookup lookup) {
++    geoRegister=std::move(reg);geoLookup=std::move(lookup);
++}
++void TcpVegas::Lab1GeometryEndpoints(uint32_t source,uint32_t destination) {
++    if (!Lab1GeometryEnabled()) return;
++    NS_ABORT_MSG_IF(!geoRegister || !geoLookup,"Geometry service is not installed");
++    m_geoSource=source;m_geoDestination=destination;m_geoAttached=true;
++    geoRegister(source,destination);
++}
++void TcpVegas::Lab1GeometrySample(Time rawRtt,Ptr<RttEstimator> estimator) {
++    if (!Lab1GeometryEnabled() || !m_geoAttached) return;
++    // TCP timestamp echo has millisecond resolution in this implementation.
++    const Time sent=std::max(Seconds(0),Simulator::Now()-rawRtt);
++    GeometryPrediction p;
++    if (!geoLookup(m_geoSource,m_geoDestination,sent,p)) {m_geoReady=false;return;}
++    if (!m_geoEstimator) {m_geoEstimator=estimator->Copy();m_geoEstimator->Reset();}
++    m_geoEstimator->Measurement(p.rtt);
++    m_geoReady=true;m_geoLast=p;m_geoSent=sent;
++}
++void TcpVegas::Lab1ApplyGeometry(Ptr<const TcpSocketState> tcb) {
++    if (!Lab1GeometryEnabled() || !m_geoCycleReady) return;
++    const Time predicted=m_geoCycleEstimate;
++    m_baseRtt=std::min(predicted,m_minRtt);
++    if (m_lab1LogPath.empty()) return;
++    static std::map<std::string,std::unique_ptr<std::ofstream>> streams;
++    auto& out=streams[m_lab1LogPath];
++    if (!out) {
++        out=std::make_unique<std::ofstream>(m_lab1LogPath+".geometry.csv");
++        NS_ABORT_MSG_IF(!*out,"Cannot open geometry audit");
++        *out<<"time_s,estimated_send_s,snapshot_s,available_s,route_id,prediction_raw_ms,prediction_smoothed_ms,cycle_min_ms,effective_base_ms,clamped\n"<<std::setprecision(15);
++    }
++    *out<<Simulator::Now().GetSeconds()<<','<<m_geoCycleSent.GetSeconds()<<','
++        <<m_geoCycleLast.computed.GetSeconds()<<','<<m_geoCycleLast.available.GetSeconds()<<','
++        <<m_geoCycleLast.route<<','<<m_geoCycleLast.rtt.GetSeconds()*1000<<','
++        <<predicted.GetSeconds()*1000<<','<<m_minRtt.GetSeconds()*1000<<','
++        <<m_baseRtt.GetSeconds()*1000<<','<<(m_baseRtt<predicted)<<'\n';
++}
++
+ } // namespace ns3
+--- a/src/internet/model/tcp-socket-base.h
++++ b/src/internet/model/tcp-socket-base.h
+@@ -13,6 +13,7 @@
+ #include "ipv6-header.h"
+ #include "tcp-socket-state.h"
+ #include "tcp-socket.h"
++#include "tcp-congestion-ops.h"
+ 
+ #include "ns3/data-rate.h"
+ #include "ns3/node.h"
+@@ -208,6 +209,8 @@
+ class TcpSocketBase : public TcpSocket
+ {
+   public:
++    // LAB1_VEGAS_DIAG: read-only observer access.
++    Ptr<TcpCongestionOps> Lab1VegasGetCongestionControl() const { return m_congestionControl; }
+     /**
+      * Get the type ID.
+      * @brief Get the type ID.
+--- a/contrib/basic-sim/model/apps/tcp-flow-send-application.cc
++++ b/contrib/basic-sim/model/apps/tcp-flow-send-application.cc
+@@ -35,6 +35,8 @@
+ #include "ns3/trace-source-accessor.h"
+ #include "ns3/tcp-socket-factory.h"
+ #include "ns3/tcp-socket-base.h"
++// LAB1_VEGAS_DIAG
++#include "lab1-vegas-socket-trace.h"
+ #include "ns3/tcp-tx-buffer.h"
+ #include "ns3/exp-util.h"
+ #include "tcp-flow-send-application.h"
+@@ -143,7 +145,16 @@
+     // Create the socket if not already
+     if (!m_socket) {
+         m_socket = Socket::CreateSocket(GetNode(), m_tid);
+-
++        if (m_enableDetailedLogging) Lab1VegasSocketTrace::Attach(m_socket,
++            m_baseLogsDir + "/tcp_flow_" + std::to_string(m_tcpFlowId));
++
++        // LAB1_VEGAS_GEOMETRY: register endpoint pair once; shared service caches the path.
++        if (TcpVegas::Lab1GeometryEnabled()) {
++            auto tcp = DynamicCast<TcpSocketBase>(m_socket);
++            auto vegas = DynamicCast<TcpVegas>(tcp->Lab1VegasGetCongestionControl());
++            NS_ABORT_MSG_IF(!vegas || !InetSocketAddress::IsMatchingType(m_peer), "Expected IPv4 Vegas flow");
++            vegas->Lab1GeometryEndpoints(GetNode()->GetId(), InetSocketAddress::ConvertFrom(m_peer).GetIpv4().Get());
++        }
+         // Must be TCP basically
+         if (m_socket->GetSocketType() != Socket::NS3_SOCK_STREAM &&
+             m_socket->GetSocketType() != Socket::NS3_SOCK_SEQPACKET) {
+@@ -349,7 +360,7 @@
+ TcpFlowSendApplication::InsertCwndLog(int64_t timestamp, uint32_t cwnd_byte)
+ {
+     std::ofstream& ofs = CachedLogStream(m_baseLogsDir + "/" + format_string("tcp_flow_%" PRIu64 "_cwnd.csv", m_tcpFlowId));
+-    ofs << m_tcpFlowId << "," << timestamp << "," << cwnd_byte << std::endl;
++    ofs << m_tcpFlowId << "," << timestamp << "," << cwnd_byte << "\n"; // LAB1_ORACLE_BUFFER: identical CSV, deferred flush
+     m_current_cwnd_byte = cwnd_byte;
+ }
+ 
+@@ -357,14 +368,14 @@
+ TcpFlowSendApplication::InsertRttLog (int64_t timestamp, int64_t rtt_ns)
+ {
+     std::ofstream& ofs = CachedLogStream(m_baseLogsDir + "/" + format_string("tcp_flow_%" PRIu64 "_rtt.csv", m_tcpFlowId));
+-    ofs << m_tcpFlowId << "," << timestamp << "," << rtt_ns << std::endl;
++    ofs << m_tcpFlowId << "," << timestamp << "," << rtt_ns << "\n"; // LAB1_ORACLE_BUFFER: identical CSV, deferred flush
+     m_current_rtt_ns = rtt_ns;
+ }
+ 
+ void
+ TcpFlowSendApplication::InsertProgressLog (int64_t timestamp, int64_t progress_byte) {
+     std::ofstream& ofs = CachedLogStream(m_baseLogsDir + "/" + format_string("tcp_flow_%" PRIu64 "_progress.csv", m_tcpFlowId));
+-    ofs << m_tcpFlowId << "," << timestamp << "," << progress_byte << std::endl;
++    ofs << m_tcpFlowId << "," << timestamp << "," << progress_byte << "\n"; // LAB1_ORACLE_BUFFER: identical CSV, deferred flush
+ }
+ 
+ void
+--- a/scratch/main_satnet/main_satnet.cc
++++ b/scratch/main_satnet/main_satnet.cc
+@@ -40,6 +40,11 @@
+ #include "ns3/ipv4-arbiter-routing-helper.h"
+ #include "ns3/gsl-if-bandwidth-helper.h"
+ 
++// LAB1_VEGAS_DIAG
++#include "lab1-vegas-queue-trace.h"
++// LAB1_VEGAS_ORACLE
++#include "lab1-oracle-probe.h"
++#include "lab1-geometry-service.h"
+ using namespace ns3;
+ 
+ int main(int argc, char *argv[]) {
+@@ -89,7 +94,13 @@
+     PingmeshScheduler pingmeshScheduler(basicSimulation, topology); // Requires enable_pingmesh_scheduler=true
+ 
+     // Run simulation
++    Lab1VegasQueueTrace::Start(topology->GetNodes(), run_dir + "/logs_ns3");
++    Lab1OracleProbe::Start(topology->GetNodes(), run_dir + "/logs_ns3");
++    Lab1Geometry::Start(topology->GetNodes(), run_dir + "/logs_ns3");
+     basicSimulation->Run();
++    Lab1Geometry::Finish();
++    Lab1OracleProbe::Finish();
++    Lab1VegasQueueTrace::Finish();
+ 
+     // Write flow results
+     tcpFlowScheduler.WriteResults();
+--- /dev/null
++++ b/contrib/basic-sim/model/apps/lab1-vegas-socket-trace.h
+@@ -0,0 +1,58 @@
++// LAB1_VEGAS_DIAG: sender socket observations only.
++#pragma once
++#include "ns3/tcp-socket-base.h"
++#include "ns3/tcp-header.h"
++#include "ns3/tcp-vegas.h"
++#include "ns3/simulator.h"
++#include <fstream>
++#include <iomanip>
++#include <memory>
++#include <vector>
++#include <cstdlib>
++
++namespace Lab1VegasSocketTrace {
++using namespace ns3;
++struct Record {
++    std::ofstream events;
++    uint32_t lastAck = 0;
++    bool seenAck = false;
++};
++inline std::vector<std::unique_ptr<Record>> records;
++inline void State(Record* r, TcpSocketState::TcpCongState_t oldState,
++                  TcpSocketState::TcpCongState_t newState) {
++    r->events << Simulator::Now().GetSeconds() << ",state," << int(oldState)
++              << ',' << int(newState) << ",-1,0\n";
++}
++inline void Retx(Record* r, Ptr<const Packet> packet, const TcpHeader& h,
++                 const Address&, const Address&, Ptr<const TcpSocketBase>) {
++    r->events << Simulator::Now().GetSeconds() << ",retransmission,-1,-1,"
++              << h.GetSequenceNumber().GetValue() << ',' << packet->GetSize() << '\n';
++}
++inline void Rx(Record* r, Ptr<const Packet>, const TcpHeader& h, Ptr<const TcpSocketBase>) {
++    if (!(h.GetFlags() & TcpHeader::ACK)) return;
++    const uint32_t ack = h.GetAckNumber().GetValue();
++    if (r->seenAck && ack == r->lastAck) {
++        r->events << Simulator::Now().GetSeconds() << ",repeated_ack,-1,-1,"
++                  << ack << ",0\n";
++    }
++    r->lastAck = ack;
++    r->seenAck = true;
++}
++inline void Attach(Ptr<Socket> sock, const std::string& prefix) {
++    const char* flag = std::getenv("LAB1_VEGAS_TRACE");
++    if (!flag || std::string(flag) != "1") return;
++    auto socket = DynamicCast<TcpSocketBase>(sock);
++    auto vegas = socket ? DynamicCast<TcpVegas>(socket->Lab1VegasGetCongestionControl()) : nullptr;
++    NS_ABORT_MSG_IF(!vegas, "LAB1_VEGAS_TRACE requires TcpVegas");
++    vegas->Lab1SetLog(prefix + "_vegas.csv");
++    auto r = std::make_unique<Record>();
++    r->events.open(prefix + "_socket_events.csv");
++    NS_ABORT_MSG_IF(!r->events, "Cannot open Vegas socket event log");
++    r->events << "time_s,kind,old_state,new_state,sequence,bytes\n" << std::setprecision(15);
++    const bool a = socket->TraceConnectWithoutContext("CongState", MakeBoundCallback(&State, r.get()));
++    const bool b = socket->TraceConnectWithoutContext("Retransmission", MakeBoundCallback(&Retx, r.get()));
++    const bool c = socket->TraceConnectWithoutContext("Rx", MakeBoundCallback(&Rx, r.get()));
++    NS_ABORT_MSG_IF(!a || !b || !c, "Could not attach Vegas socket traces");
++    records.push_back(std::move(r));
++}
++}
+--- /dev/null
++++ b/scratch/main_satnet/lab1-vegas-queue-trace.h
+@@ -0,0 +1,106 @@
++// LAB1_VEGAS_DIAG: all device queues, event-integrated occupancy and queue waiting time.
++#pragma once
++#include "ns3/node-container.h"
++#include "ns3/channel.h"
++#include "ns3/point-to-point-net-device.h"
++#include "ns3/point-to-point-laser-net-device.h"
++#include "ns3/gsl-net-device.h"
++#include "ns3/simulator.h"
++#include <cstdlib>
++#include <fstream>
++#include <iomanip>
++#include <memory>
++#include <vector>
++#include <algorithm>
++#include <unordered_map>
++#include <deque>
++
++namespace Lab1VegasQueueTrace {
++using namespace ns3;
++struct Record {
++    uint32_t node, device, count = 0, peak = 0;
++    uint64_t drops = 0, dequeued = 0;
++    std::string type;
++    double area = 0, last = 0, waitSum = 0, waitMax = 0;
++    std::unordered_map<uint64_t, std::deque<Time>> entered;
++    void Touch() {
++        const double now = Simulator::Now().GetSeconds();
++        area += count * (now-last); last = now;
++    }
++};
++inline std::vector<std::unique_ptr<Record>> records;
++inline std::ofstream output, dropOutput;
++inline double previous = 0;
++inline bool enabled = false;
++inline void Occupancy(Record* r, uint32_t, uint32_t value) {
++    r->Touch(); r->count=value; r->peak=std::max(r->peak,value);
++}
++inline void Enqueue(Record* r, Ptr<const Packet> p) {
++    r->entered[p->GetUid()].push_back(Simulator::Now());
++}
++inline void Dequeue(Record* r, Ptr<const Packet> p) {
++    auto it=r->entered.find(p->GetUid());
++    NS_ABORT_MSG_IF(it==r->entered.end() || it->second.empty(), "Unmatched queue dequeue");
++    const double wait=(Simulator::Now()-it->second.front()).GetSeconds();
++    it->second.pop_front(); if(it->second.empty()) r->entered.erase(it);
++    r->waitSum+=wait; r->waitMax=std::max(r->waitMax,wait); ++r->dequeued;
++}
++inline void Drop(Record* r, Ptr<const Packet> p) {
++    ++r->drops;
++    dropOutput << Simulator::Now().GetSeconds() << ',' << r->node << ',' << r->device
++               << ',' << r->type << ',' << p->GetUid() << ',' << p->GetSize() << '\n';
++}
++inline void Flush() {
++    const double now=Simulator::Now().GetSeconds(), dt=now-previous;
++    if(!enabled || dt<=0) return;
++    for(auto& r:records) {
++        r->Touch();
++        if(r->area>0 || r->peak>0 || r->drops>0 || r->count>0 || r->dequeued>0) {
++            output << now << ',' << dt << ',' << r->node << ',' << r->device << ','
++                   << r->type << ',' << r->area/dt << ',' << r->peak << ',' << r->count
++                   << ',' << r->drops << ',' << r->dequeued << ',' << r->waitSum*1000 << ','
++                   << (r->dequeued ? r->waitSum*1000/r->dequeued : 0) << ',' << r->waitMax*1000 << '\n';
++        }
++        r->area=0; r->peak=r->count; r->drops=0; r->dequeued=0; r->waitSum=0; r->waitMax=0;
++    }
++    previous=now;
++}
++inline void Tick() { Flush(); Simulator::Schedule(MilliSeconds(10),&Tick); }
++inline void Start(NodeContainer nodes,const std::string& logs) {
++    const char* flag=std::getenv("LAB1_VEGAS_TRACE");
++    if(!flag || std::string(flag)!="1") return;
++    enabled=true;
++    output.open(logs+"/vegas_queue_10ms.csv");
++    dropOutput.open(logs+"/vegas_queue_drops.csv");
++    std::ofstream inventory(logs+"/vegas_queue_inventory.csv");
++    NS_ABORT_MSG_IF(!output || !dropOutput || !inventory,"Cannot open queue traces");
++    output << "time_s,window_s,node,device,type,mean_packets,peak_packets,end_packets,drops,dequeued,wait_sum_ms,mean_wait_ms,max_wait_ms\n" << std::setprecision(15);
++    dropOutput << "time_s,node,device,type,packet_uid,bytes\n" << std::setprecision(15);
++    inventory << "node,device,type,channel_id,max_queue\n";
++    uint32_t islCount=0,gslCount=0;
++    for(uint32_t n=0;n<nodes.GetN();++n) {
++        auto node=nodes.Get(n);
++        for(uint32_t d=0;d<node->GetNDevices();++d) {
++            auto dev=node->GetDevice(d); Ptr<Queue<Packet>> queue; std::string type;
++            if(auto p=DynamicCast<PointToPointLaserNetDevice>(dev)) {queue=p->GetQueue();type="ISL";++islCount;}
++            else if(auto p=DynamicCast<PointToPointNetDevice>(dev)) {queue=p->GetQueue();type="P2P";}
++            else if(auto p=DynamicCast<GSLNetDevice>(dev)) {queue=p->GetQueue();type="GSL";++gslCount;}
++            if(!queue) continue;
++            auto r=std::make_unique<Record>();r->node=node->GetId();r->device=d;r->type=type;
++            r->count=queue->GetNPackets();r->peak=r->count;r->last=Simulator::Now().GetSeconds();
++            NS_ABORT_MSG_IF(r->count!=0,"Queue trace attached after traffic began");
++            const bool a=queue->TraceConnectWithoutContext("PacketsInQueue",MakeBoundCallback(&Occupancy,r.get()));
++            const bool b=queue->TraceConnectWithoutContext("Drop",MakeBoundCallback(&Drop,r.get()));
++            const bool c=queue->TraceConnectWithoutContext("Enqueue",MakeBoundCallback(&Enqueue,r.get()));
++            const bool e=queue->TraceConnectWithoutContext("Dequeue",MakeBoundCallback(&Dequeue,r.get()));
++            NS_ABORT_MSG_IF(!a || !b || !c || !e,"Queue trace connection failed");
++            inventory << r->node << ',' << d << ',' << type << ','
++                      << (dev->GetChannel()?dev->GetChannel()->GetId():0) << ',' << queue->GetMaxSize() << '\n';
++            records.push_back(std::move(r));
++        }
++    }
++    NS_ABORT_MSG_IF(islCount==0 || gslCount==0,"Incomplete satellite queue coverage");
++    Simulator::Schedule(MilliSeconds(10),&Tick);
++}
++inline void Finish() {if(enabled){Flush();output.flush();dropOutput.flush();}}
++}
+--- /dev/null
++++ b/scratch/main_satnet/lab1-oracle-probe.h
+@@ -0,0 +1,66 @@
++// Independent no-load RTT calibration. IPv4 packet sizes match full TCP data
++// and timestamp-enabled ACKs: 1432 and 52 bytes before link-layer framing.
++#pragma once
++#include "ns3/node-container.h"
++#include "ns3/ipv4.h"
++#include "ns3/inet-socket-address.h"
++#include "ns3/udp-socket-factory.h"
++#include "ns3/socket.h"
++#include "ns3/simulator.h"
++#include <array>
++#include <cstdlib>
++#include <fstream>
++#include <iomanip>
++#include <vector>
++
++namespace Lab1OracleProbe {
++using namespace ns3;
++inline Ptr<Socket> sender, receiver;
++inline std::vector<Time> sent;
++inline std::ofstream output;
++inline bool enabled=false;
++inline void ReceiveReply(Ptr<Socket> sock) {
++    while(auto p=sock->Recv()) {
++        NS_ABORT_MSG_IF(p->GetSize()!=24,"Unexpected calibration reply size");
++        uint8_t bytes[24];p->CopyData(bytes,24);
++        uint64_t id=0;for(int i=0;i<8;++i)id=(id<<8)|bytes[i];
++        NS_ABORT_MSG_IF(id>=sent.size(),"Unknown calibration probe");
++        const Time now=Simulator::Now();
++        output << id << ',' << sent[id].GetSeconds() << ',' << now.GetSeconds() << ','
++               << (now-sent[id]).GetNanoSeconds() << ",1404,24\n";
++    }
++}
++inline void Echo(Ptr<Socket> sock) {
++    Address from;
++    while(auto p=sock->RecvFrom(from)) {
++        NS_ABORT_MSG_IF(p->GetSize()!=1404,"Unexpected calibration request size");
++        uint8_t bytes[24];p->CopyData(bytes,24);
++        NS_ABORT_MSG_IF(sock->SendTo(Create<Packet>(bytes,24),0,from)!=24,"Calibration reply failed");
++    }
++}
++inline void Send() {
++    const uint64_t id=sent.size();std::array<uint8_t,1404> bytes{};
++    for(int i=0;i<8;++i)bytes[i]=uint8_t(id>>(56-8*i));
++    sent.push_back(Simulator::Now());
++    NS_ABORT_MSG_IF(sender->Send(Create<Packet>(bytes.data(),bytes.size()))!=1404,"Calibration request failed");
++    Simulator::Schedule(MilliSeconds(10),&Send);
++}
++inline void Start(NodeContainer nodes,const std::string& logs) {
++    const char* flag=std::getenv("LAB1_ORACLE_CALIBRATE");
++    if(!flag || std::string(flag)!="1")return;
++    enabled=true;NS_ABORT_MSG_IF(nodes.GetN()!=1586,"Calibration expects the existing Seoul-London scenario");
++    output.open(logs+"/oracle_probe.csv");
++    NS_ABORT_MSG_IF(!output,"Cannot open oracle calibration log");
++    output << "probe_id,send_s,receive_s,rtt_ns,request_payload_bytes,reply_payload_bytes\n" << std::setprecision(15);
++    receiver=Socket::CreateSocket(nodes.Get(1585),UdpSocketFactory::GetTypeId());
++    NS_ABORT_MSG_IF(receiver->Bind(InetSocketAddress(Ipv4Address::GetAny(),51000))!=0,"Cannot bind calibration receiver");
++    receiver->SetRecvCallback(MakeCallback(&Echo));
++    sender=Socket::CreateSocket(nodes.Get(1584),UdpSocketFactory::GetTypeId());
++    NS_ABORT_MSG_IF(sender->Bind()!=0,"Cannot bind calibration sender");
++    auto destination=nodes.Get(1585)->GetObject<Ipv4>()->GetAddress(1,0).GetLocal();
++    NS_ABORT_MSG_IF(sender->Connect(InetSocketAddress(destination,51000))!=0,"Cannot connect calibration sender");
++    sender->SetRecvCallback(MakeCallback(&ReceiveReply));
++    Simulator::ScheduleNow(&Send);
++}
++inline void Finish(){if(enabled)output.flush();}
++}
+--- /dev/null
++++ b/src/internet/model/lab1-vegas-rolling-min.h
+@@ -0,0 +1,25 @@
++// Exact sliding-window minimum; timestamps and RTTs are integer nanoseconds.
++#pragma once
++#include <cstdint>
++#include <deque>
++#include <utility>
++#include <cassert>
++namespace ns3 {
++class Lab1RollingRtt {
++public:
++    void Add(int64_t now, int64_t rtt, int64_t window) {
++        assert(window > 0 && rtt > 0);
++        assert(m_samples.empty() || now >= m_samples.back().first);
++        while (!m_samples.empty() && m_samples.front().first < now - window)
++            m_samples.pop_front();
++        // A newer equal minimum survives longer than an older one.
++        while (!m_samples.empty() && m_samples.back().second >= rtt)
++            m_samples.pop_back();
++        m_samples.emplace_back(now, rtt);
++    }
++    int64_t Minimum() const { assert(!m_samples.empty()); return m_samples.front().second; }
++    int64_t SourceTime() const { assert(!m_samples.empty()); return m_samples.front().first; }
++private:
++    std::deque<std::pair<int64_t, int64_t>> m_samples;
++};
++}
+--- a/src/internet/model/tcp-socket-base.cc
++++ b/src/internet/model/tcp-socket-base.cc
+@@ -14,6 +14,7 @@
+     }
+ 
+ #include "tcp-socket-base.h"
++#include "tcp-vegas.h" // LAB1_VEGAS_GEOMETRY
+ 
+ #include "ipv4-end-point.h"
+ #include "ipv4-route.h"
+@@ -3886,6 +3887,10 @@
+     if (!rtt.IsZero())
+     {
+         m_rtt->Measurement(rtt); // Log the measurement
++        if (TcpVegas::Lab1GeometryEnabled()) {
++            if (auto vegas = DynamicCast<TcpVegas>(m_congestionControl))
++                vegas->Lab1GeometrySample(rtt, m_rtt);
++        }
+         // RFC 6298, clause 2.4
+         m_rto = Max(m_rtt->GetEstimate() + Max(m_clockGranularity, m_rtt->GetVariation() * 4),
+                     m_minRto);
+--- /dev/null
++++ b/scratch/main_satnet/lab1-geometry-service.h
+@@ -0,0 +1,136 @@
++// Periodic online path cache. Uses only current routing, positions and link attributes.
++#pragma once
++#include "ns3/tcp-vegas.h"
++#include "ns3/ipv4-arbiter-routing.h"
++#include "ns3/arbiter-single-forward.h"
++#include "ns3/mobility-model.h"
++#include "ns3/data-rate.h"
++#include "ns3/double.h"
++#include "ns3/traffic-control-layer.h"
++#include <map>
++#include <deque>
++#include <set>
++#include <fstream>
++#include <iomanip>
++#include <chrono>
++#include <cmath>
++namespace Lab1Geometry {
++using namespace ns3;
++using Clock=std::chrono::steady_clock;
++using Key=std::pair<uint32_t,uint32_t>;
++struct Entry {TcpVegas::GeometryPrediction p;double propagationMs=0,serializationMs=0;uint32_t hops=0;};
++struct Pair {uint32_t destination;std::deque<Entry> history;};
++inline NodeContainer nodes;
++inline std::map<uint32_t,uint32_t> ipToNode;
++inline std::map<Key,Pair> pairs;
++inline std::ofstream predictions,drops;
++inline std::string logs;
++inline Time interval=MilliSeconds(100),deliveryDelay=Seconds(0);
++inline uint64_t builds=0,lookups=0,misses=0,hops=0,buildNs=0,lookupNs=0,maxBuildNs=0,maxLookupNs=0,tcDrops=0,maxEntries=0,registrations=0;
++inline bool enabled=false;
++inline double EnvMs(const char* key,double fallback) {
++    const char* p=std::getenv(key);if(!p || !*p)return fallback;
++    char* end=nullptr;const double value=std::strtod(p,&end);
++    NS_ABORT_MSG_IF(end==p || *end || !std::isfinite(value) || value<0,"Invalid geometry timing");
++    return value;
++}
++inline void Walk(uint32_t source,uint32_t destination,uint32_t bytes,Entry& entry) {
++    std::set<uint32_t> visited;uint32_t current=source;
++    while(current!=destination) {
++        NS_ABORT_MSG_IF(!visited.insert(current).second || visited.size()>nodes.GetN(),"Routing loop in prediction");
++        auto node=nodes.Get(current);
++        auto route=node->GetObject<Ipv4>()->GetRoutingProtocol()->GetObject<Ipv4ArbiterRouting>();
++        auto arbiter=DynamicCast<ArbiterSingleForward>(route->GetArbiter());
++        NS_ABORT_MSG_IF(!arbiter,"Expected single-forward routing");
++        const auto state=arbiter->TopologySatelliteNetworkDecide(source,destination,nullptr,Ipv4Header(),true);
++        const int32_t next=std::get<0>(state),iface=std::get<1>(state);
++        NS_ABORT_MSG_IF(next<0 || iface<0,"No route in prediction");
++        // The arbiter already translated fstate's index to the IPv4 interface index.
++        auto ipv4=node->GetObject<Ipv4>();
++        NS_ABORT_MSG_IF(uint32_t(iface)>=ipv4->GetNInterfaces(),"Invalid prediction interface");
++        auto device=ipv4->GetNetDevice(iface);
++        NS_ABORT_MSG_IF(!device || !device->GetChannel(),"Prediction route has no physical channel");
++        DataRateValue rate;device->GetAttribute("DataRate",rate);
++        DoubleValue speed;device->GetChannel()->GetAttribute("PropagationSpeed",speed);
++        const auto from=node->GetObject<MobilityModel>()->GetPosition();
++        const auto to=nodes.Get(next)->GetObject<MobilityModel>()->GetPosition();
++        // Cheap snapshot approximation: positions and routing are held at computation time.
++        entry.propagationMs+=CalculateDistance(from,to)/speed.Get()*1000;
++        entry.serializationMs+=rate.Get().CalculateBytesTxTime(bytes).GetSeconds()*1000;
++        entry.p.route^=uint64_t(current)*nodes.GetN()+next;entry.p.route*=1099511628211ULL;
++        ++entry.hops;++hops;current=next;
++    }
++}
++inline void Build(const Key& key,Pair& pair) {
++    const auto start=Clock::now();Entry e;e.p.computed=Simulator::Now();
++    e.p.available=e.p.computed+deliveryDelay;e.p.route=1469598103934665603ULL;
++    // Normal MSS=1380, TCP timestamp header=32, IPv4=20, PPP=2.
++    Walk(key.first,pair.destination,1434,e);Walk(pair.destination,key.first,54,e);
++    e.p.rtt=Seconds((e.propagationMs+e.serializationMs)/1000);
++    pair.history.push_back(e);
++    // Bound per-path storage. Also retain one predecessor for boundary lookups.
++    const Time oldest=Simulator::Now()-Seconds(10)-deliveryDelay;
++    while(pair.history.size()>2 && pair.history[1].p.available<oldest)pair.history.pop_front();
++    maxEntries=std::max(maxEntries,uint64_t(pair.history.size()));++builds;
++    const uint64_t elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();
++    buildNs+=elapsed;maxBuildNs=std::max(maxBuildNs,elapsed);
++    predictions<<e.p.computed.GetSeconds()<<','<<e.p.available.GetSeconds()<<','<<key.first<<','<<pair.destination<<','
++        <<e.p.route<<','<<e.hops<<','<<e.propagationMs<<','<<e.serializationMs<<','<<e.p.rtt.GetSeconds()*1000<<','<<elapsed<<'\n';
++}
++inline void Register(uint32_t source,uint32_t destinationIp) {
++    ++registrations;const Key key{source,destinationIp};if(pairs.count(key))return;
++    NS_ABORT_MSG_IF(!ipToNode.count(destinationIp),"Unknown destination IP");
++    auto it=pairs.emplace(key,Pair{ipToNode.at(destinationIp),{}}).first;Build(key,it->second);
++}
++inline bool Lookup(uint32_t source,uint32_t destinationIp,Time sent,TcpVegas::GeometryPrediction& out) {
++    const auto start=Clock::now();++lookups;bool ok=false;
++    auto found=pairs.find({source,destinationIp});
++    if(found!=pairs.end()) {
++        auto& h=found->second.history;
++        const auto it=std::upper_bound(h.begin(),h.end(),sent,[](Time t,const Entry& e){return t<e.p.available;});
++        if(it!=h.begin()) {out=std::prev(it)->p;ok=true;}
++        // Startup exception: zero-state prediction was already computed at connection start.
++        // If delivery is delayed, do not use it until it has actually arrived.
++    }
++    if(!ok)++misses;
++    const uint64_t elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start).count();
++    lookupNs+=elapsed;maxLookupNs=std::max(maxLookupNs,elapsed);
++    return ok;
++}
++inline void Tick() {for(auto& item:pairs)Build(item.first,item.second);Simulator::Schedule(interval,&Tick);}
++inline void TcDrop(uint32_t node,Ptr<const Packet> p) {
++    ++tcDrops;drops<<Simulator::Now().GetSeconds()<<','<<node<<','<<p->GetUid()<<','<<p->GetSize()<<'\n';
++}
++inline void Start(NodeContainer all,const std::string& directory) {
++    nodes=all;logs=directory;enabled=TcpVegas::Lab1GeometryEnabled();
++    // Additional observation only; catches stopped-device drops missed by Queue::Drop.
++    drops.open(logs+"/traffic_control_drops.csv");drops<<"time_s,node,packet_uid,bytes\n"<<std::setprecision(15);
++    for(uint32_t n=0;n<nodes.GetN();++n) {
++        if(auto tc=nodes.Get(n)->GetObject<TrafficControlLayer>())
++            NS_ABORT_MSG_IF(!tc->TraceConnectWithoutContext("TcDrop",MakeBoundCallback(&TcDrop,n)),"Cannot attach TcDrop");
++        auto ip=nodes.Get(n)->GetObject<Ipv4>();
++        for(uint32_t i=1;i<ip->GetNInterfaces();++i)
++            for(uint32_t a=0;a<ip->GetNAddresses(i);++a)ipToNode[ip->GetAddress(i,a).GetLocal().Get()]=n;
++    }
++    if(!enabled)return;
++    interval=Seconds(EnvMs("LAB1_GEOMETRY_INTERVAL_MS",100)/1000);
++    deliveryDelay=Seconds(EnvMs("LAB1_GEOMETRY_DELIVERY_MS",0)/1000);
++    NS_ABORT_MSG_IF(interval<=Seconds(0) || interval>Seconds(1) || deliveryDelay>Seconds(5),"Invalid geometry interval/delay");
++    predictions.open(logs+"/geometry_predictions.csv");
++    predictions<<"computed_s,available_s,source,destination,route_id,roundtrip_hops,propagation_ms,serialization_ms,predicted_ms,compute_ns\n"<<std::setprecision(15);
++    TcpVegas::Lab1SetGeometryService(&Register,&Lookup);
++    // Read current routing after updates at the same nominal simulation timestamp.
++    Simulator::Schedule(interval+NanoSeconds(1),&Tick);
++}
++inline void Finish() {
++    drops.flush();predictions.flush();std::ofstream out(logs+"/geometry_cost.json");
++    out<<std::setprecision(15)<<"{\"enabled\":"<<(enabled?"true":"false")
++       <<",\"interval_ms\":"<<interval.GetSeconds()*1000<<",\"delivery_ms\":"<<deliveryDelay.GetSeconds()*1000
++       <<",\"registered_connections\":"<<registrations<<",\"cached_paths\":"<<pairs.size()
++       <<",\"prediction_builds\":"<<builds<<",\"link_visits\":"<<hops<<",\"cache_lookups\":"<<lookups
++       <<",\"cache_misses\":"<<misses<<",\"max_history_entries_per_path\":"<<maxEntries
++       <<",\"build_wall_ns\":"<<buildNs<<",\"lookup_wall_ns\":"<<lookupNs
++       <<",\"max_build_wall_ns\":"<<maxBuildNs<<",\"max_lookup_wall_ns\":"<<maxLookupNs
++       <<",\"traffic_control_drop_events\":"<<tcDrops<<"}\n";
++}
++}
